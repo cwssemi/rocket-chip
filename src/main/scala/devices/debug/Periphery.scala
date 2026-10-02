@@ -14,7 +14,8 @@ import freechips.rocketchip.interrupts.{IntSyncXbar, NullIntSyncSource}
 import freechips.rocketchip.jtag.JTAGIO
 import freechips.rocketchip.prci.{ClockSinkNode, ClockSinkParameters}
 import freechips.rocketchip.subsystem.{BaseSubsystem, CBUS, FBUS, ResetSynchronous, SubsystemResetSchemeKey, TLBusWrapperLocation}
-import freechips.rocketchip.tilelink.{TLFragmenter, TLWidthWidget}
+import freechips.rocketchip.tilelink.{TLBuffer, TLFragmenter, TLWidthWidget}
+import freechips.rocketchip.diplomacy.BufferParams
 import freechips.rocketchip.util.{AsyncResetSynchronizerShiftReg, CanHavePSDTestModeIO, ClockGate, PSDTestMode, PlusArg, ResetSynchronizerShiftReg}
 
 import freechips.rocketchip.util.BooleanToAugmentedBoolean
@@ -40,6 +41,24 @@ case class DebugAttachParams(
 }
 
 case object ExportDebug extends Field(DebugAttachParams())
+
+/** Buffering between the debug module's bus coupler and the DM itself.
+  *
+  * INERT BY DEFAULT (`BufferParams.none`), so every existing configuration elaborates unchanged.
+  *
+  * WHY. Measured on VCU118 xcvu9p 2026-09-04: the critical path of a Rocket-only design was
+  * `pbus/buffer/nodeOut_a_q -> tlDM/dmInner/programBufferMem`, 9.900 ns at 94% route / 6% logic
+  * over 5 logic levels. Six of the seven cells on it are in the pbus buffer and the
+  * `coupler_to_debug` fragmenter/repeater; only the destination flop is inside the DM. The delay
+  * is in the INTERCONNECT, not in the debug module, so shrinking the DM does not reach it.
+  *
+  * WHY THIS DOES NOT VIOLATE `require(dmInner.tlNode.concurrency == 0)`. That require exists so
+  * "spurious processor accesses to the DM don't need to enable the clock" -- the DM's TL slave
+  * must answer while its `dmactive` clock gate is closed. It constrains registers INSIDE
+  * `dmInner`. A buffer in the coupler sits on the bus clock, which is always running, so a
+  * processor access still gets a response with the DM clock gated; it just arrives a cycle later.
+  */
+case object DebugCouplerBuffer extends Field[BufferParams](BufferParams.none)
 
 class ClockedAPBBundle(params: APBBundleParameters) extends APBBundle(params) {
   val clock = Clock()
@@ -87,7 +106,7 @@ trait HasPeripheryDebug { this: BaseSubsystem =>
   lazy val debugOpt = p(DebugModuleKey).map { params =>
     val tlDM = LazyModule(new TLDebugModule(tlbus.beatBytes))
 
-    tlDM.node := tlbus.coupleTo("debug"){ TLFragmenter(tlbus.beatBytes, tlbus.blockBytes, nameSuffix = Some("Debug")) := _ }
+    tlDM.node := tlbus.coupleTo("debug"){ TLBuffer(p(DebugCouplerBuffer)) := TLFragmenter(tlbus.beatBytes, tlbus.blockBytes, nameSuffix = Some("Debug")) := _ }
     tlDM.dmInner.dmInner.customNode := debugCustomXbarOpt.get.node
 
     (apbDebugNodeOpt zip tlDM.apbNodeOpt) foreach { case (master, slave) =>
